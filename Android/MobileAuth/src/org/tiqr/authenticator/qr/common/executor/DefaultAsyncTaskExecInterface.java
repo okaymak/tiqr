@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009 ZXing authors
+ * Copyright (C) 2012 ZXing authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,18 @@
  * limitations under the License.
  */
 
-package org.tiqr.authenticator.qr;
+package org.tiqr.authenticator.qr.common.executor;
 
-import com.google.zxing.ResultPoint;
-import com.google.zxing.ResultPointCallback;
+import android.os.AsyncTask;
 
-final class ViewfinderResultPointCallback implements ResultPointCallback {
-
-    private final ViewfinderView viewfinderView;
-
-    ViewfinderResultPointCallback(ViewfinderView viewfinderView) {
-        this.viewfinderView = viewfinderView;
-    }
+/**
+ * Before Honeycomb, {@link AsyncTask} uses parallel execution by default, which is desired. Good thing too since there is no API to request otherwise.
+ */
+public final class DefaultAsyncTaskExecInterface implements AsyncTaskExecInterface {
 
     @Override
-    public void foundPossibleResultPoint(ResultPoint point) {
-        viewfinderView.addPossibleResultPoint(point);
+    public <T> void execute(AsyncTask<T, ?, ?> task, T... args) {
+        task.execute(args);
     }
 
 }

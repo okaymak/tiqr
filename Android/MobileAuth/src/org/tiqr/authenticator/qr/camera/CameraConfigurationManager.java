@@ -17,132 +17,87 @@
 package org.tiqr.authenticator.qr.camera;
 
 import java.lang.reflect.Method;
-import java.util.regex.Pattern;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 
+import org.tiqr.authenticator.qr.camera.exposure.ExposureInterface;
+import org.tiqr.authenticator.qr.camera.exposure.ExposureManager;
+
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Point;
 import android.hardware.Camera;
 import android.os.Build;
+import android.preference.PreferenceManager;
 import android.util.Log;
-import android.view.SurfaceHolder;
+import android.view.Display;
+import android.view.WindowManager;
 
 /**
- * Camera configuration manager.
+ * A class which deals with reading, parsing, and setting the camera parameters which are used to configure the camera hardware.
  */
-final class CameraConfigurationManager
-{
-    private static final String TAG = CameraConfigurationManager.class.getSimpleName();
-    private static final Pattern COMMA_PATTERN = Pattern.compile(",");
+final class CameraConfigurationManager {
 
-    private Point _surfaceResolution;
-    private Point _cameraResolution;
-    private int _previewFormat;
-    private String _previewFormatString;
+    private static final String TAG = "CameraConfiguration";
 
-    /**
-     * Calculates the optimal preview size
-     * 
-     * @param previewSizeValueString
-     * @param surfaceResolution
-     * 
-     * @return optimal preview size
-     */
-    private static Point _calculateOptimalPreviewSize(CharSequence previewSizeValueString, Point surfaceResolution)
-    {
-        int bestX = 0;
-        int bestY = 0;
-        int diff = Integer.MAX_VALUE;
-        for (String previewSize : COMMA_PATTERN.split(previewSizeValueString)) {
-            previewSize = previewSize.trim();
-            int dimPosition = previewSize.indexOf('x');
-            if (dimPosition < 0) {
-                Log.w(TAG, "Bad preview-size: " + previewSize);
-                continue;
-            }
+    // This is bigger than the size of a small screen, which is still supported. The routine
+    // below will still select the default (presumably 320x240) size for these. This prevents
+    // accidental selection of very low resolution on some devices.
+    private static final int MIN_PREVIEW_PIXELS = 470 * 320; // normal screen
+    private static final int MAX_PREVIEW_PIXELS = 1280 * 720;
 
-            int newX;
-            int newY;
-            try {
-                newX = Integer.parseInt(previewSize.substring(0, dimPosition));
-                newY = Integer.parseInt(previewSize.substring(dimPosition + 1));
-            } catch (NumberFormatException nfe) {
-                Log.w(TAG, "Bad preview-size: " + previewSize);
-                continue;
-            }
+    private final Context context;
+    private Point screenResolution;
+    private Point cameraResolution;
+    private final ExposureInterface exposure;
 
-            int newDiff = Math.abs(newX - surfaceResolution.x) + Math.abs(newY - surfaceResolution.y);
-            if (newDiff == 0) {
-                bestX = newX;
-                bestY = newY;
-                break;
-            } else if (newDiff < diff) {
-                bestX = newX;
-                bestY = newY;
-                diff = newDiff;
-            }
-
-        }
-
-        if (bestX > 0 && bestY > 0) {
-            return new Point(bestX, bestY);
-        }
-        
-        return null;
-    }       
-    
-
-    /**
-     * Calculates the optimal camera resolution.
-     * 
-     * @param parameters        camera parameters
-     * @param surfaceResolution surface resolution
-     * @return
-     */
-    private static Point _calculateOptimalCameraResolution(Camera.Parameters parameters, Point surfaceResolution)
-    {
-        String previewSizeValueString = parameters.get("preview-size-values");
-        if (previewSizeValueString == null) {
-            previewSizeValueString = parameters.get("preview-size-value");
-        }
-
-        Point cameraResolution = null;
-
-        if (previewSizeValueString != null) {
-            Log.d(TAG, "preview-size-values parameter: " + previewSizeValueString);
-            cameraResolution = _calculateOptimalPreviewSize(previewSizeValueString, surfaceResolution);
-        }
-
-        if (cameraResolution == null) {
-            // Ensure that the camera resolution is a multiple of 8, as the surface may not be.
-            cameraResolution = new Point((surfaceResolution.x >> 3) << 3, (surfaceResolution.y >> 3) << 3);
-        }
-
-        return cameraResolution;
-    } 
+    CameraConfigurationManager(Context context) {
+        this.context = context;
+        exposure = new ExposureManager().build();
+    }
 
     /**
      * Reads, one time, values from the camera that are needed by the app.
      */
-    void init(Camera camera, SurfaceHolder surfaceHolder)
-    {
+    void initFromCameraParameters(Camera camera) {
         Camera.Parameters parameters = camera.getParameters();
-        _previewFormat = parameters.getPreviewFormat();
-        _previewFormatString = parameters.get("preview-format");
-        Log.d(TAG, "Default preview format: " + _previewFormat + '/' + _previewFormatString);
-        _surfaceResolution = new Point(surfaceHolder.getSurfaceFrame().width(), surfaceHolder.getSurfaceFrame().height());
-        Log.d(TAG, "Surface resolution: " + _surfaceResolution);
-        _cameraResolution = _calculateOptimalCameraResolution(parameters, _surfaceResolution);
-        Log.d(TAG, "Camera resolution: " + _cameraResolution);
+        WindowManager manager = (WindowManager)context.getSystemService(Context.WINDOW_SERVICE);
+        Display display = manager.getDefaultDisplay();
+        int width = display.getWidth();
+        int height = display.getHeight();
+
+        screenResolution = new Point(width, height);
+        Log.i(TAG, "Screen resolution: " + screenResolution);
+        cameraResolution = findBestPreviewSizeValue(parameters, screenResolution);
+        Log.i(TAG, "Camera resolution: " + cameraResolution);
     }
 
-    /**
-     * Sets the camera up to take preview images which are used for both preview
-     * and decoding. We detect the preview format here so that
-     * buildLuminanceSource() can build an appropriate LuminanceSource subclass.
-     * In the future we may want to force YUV420SP as it's the smallest, and the
-     * planar Y can be used for barcode scanning without a copy in some cases.
-     */
-    public void setDesiredCameraParameters(Camera camera)
-    {
+    void setDesiredCameraParameters(Camera camera) {
+        Camera.Parameters parameters = camera.getParameters();
+
+        if (parameters == null) {
+            Log.w(TAG, "Device error: no camera parameters are available. Proceeding without configuration.");
+            return;
+        }
+
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+
+        initializeTorch(parameters, prefs);
+        String focusMode = null;
+        focusMode = findSettableValue(parameters.getSupportedFocusModes(),
+                Camera.Parameters.FOCUS_MODE_AUTO);
+        // Maybe selected auto-focus but not available, so fall through here:
+        if (focusMode == null) {
+            focusMode = findSettableValue(parameters.getSupportedFocusModes(), Camera.Parameters.FOCUS_MODE_MACRO, "edof"); // Camera.Parameters.FOCUS_MODE_EDOF
+                                                                                                                            // in 2.2+
+        }
+        if (focusMode != null) {
+            parameters.setFocusMode(focusMode);
+        }
+
         // TODO: find a way to do this without falling back to reflection
         boolean usePortraitOrientation = Integer.parseInt(Build.VERSION.SDK) >= 8;
         if (usePortraitOrientation) { // only 2.2
@@ -154,48 +109,122 @@ final class CameraConfigurationManager
             }
         }   
         
-        Camera.Parameters parameters = camera.getParameters();
-        parameters.setPreviewSize(_cameraResolution.x, _cameraResolution.y);
+        parameters.setPreviewSize(cameraResolution.x, cameraResolution.y);
         parameters.set("orientation", "portrait");
         parameters.set("rotation", 90);
         camera.setParameters(parameters);
-        
-        Log.d(TAG, "Set camera preview size: " + parameters.getPreviewSize());
     }
 
-    /**
-     * Returns the camera resolution used.
-     * 
-     * @return camera resolution
-     */
-    public Point getCameraResolution()
-    {
-        return _cameraResolution;
+    Point getCameraResolution() {
+        return cameraResolution;
     }
 
-    /**
-     * Returns the surface resolution.
-     * 
-     * @return surface resolution
-     */
-    public Point getSurfaceResolution()
-    {
-        return _surfaceResolution;
+    Point getScreenResolution() {
+        return screenResolution;
     }
 
-    /**
-     * Returns the preview format.
-     */
-    public int getPreviewFormat()
-    {
-        return _previewFormat;
+    void setTorch(Camera camera, boolean newSetting) {
+        Camera.Parameters parameters = camera.getParameters();
+        doSetTorch(parameters, newSetting);
+        camera.setParameters(parameters);
     }
 
-    /**
-     * Returns the preview format string.
-     */
-    public String getPreviewFormatString()
-    {
-        return _previewFormatString;
+    private void initializeTorch(Camera.Parameters parameters, SharedPreferences prefs) {
+        boolean currentSetting = false;
+        doSetTorch(parameters, currentSetting);
     }
+
+    private void doSetTorch(Camera.Parameters parameters, boolean newSetting) {
+        String flashMode;
+        if (newSetting) {
+            flashMode = findSettableValue(parameters.getSupportedFlashModes(), Camera.Parameters.FLASH_MODE_TORCH, Camera.Parameters.FLASH_MODE_ON);
+        } else {
+            flashMode = findSettableValue(parameters.getSupportedFlashModes(), Camera.Parameters.FLASH_MODE_OFF);
+        }
+        if (flashMode != null) {
+            parameters.setFlashMode(flashMode);
+        }
+
+        exposure.setExposure(parameters, newSetting);
+    }
+
+    private Point findBestPreviewSizeValue(Camera.Parameters parameters, Point screenResolution) {
+
+        // Sort by size, descending
+        List<Camera.Size> supportedPreviewSizes = new ArrayList<Camera.Size>(parameters.getSupportedPreviewSizes());
+        Collections.sort(supportedPreviewSizes, new Comparator<Camera.Size>() {
+            @Override
+            public int compare(Camera.Size a, Camera.Size b) {
+                int aPixels = a.height * a.width;
+                int bPixels = b.height * b.width;
+                if (bPixels < aPixels) {
+                    return -1;
+                }
+                if (bPixels > aPixels) {
+                    return 1;
+                }
+                return 0;
+            }
+        });
+
+        if (Log.isLoggable(TAG, Log.INFO)) {
+            StringBuilder previewSizesString = new StringBuilder();
+            for (Camera.Size supportedPreviewSize : supportedPreviewSizes) {
+                previewSizesString.append(supportedPreviewSize.width).append('x').append(supportedPreviewSize.height).append(' ');
+            }
+            Log.i(TAG, "Supported preview sizes: " + previewSizesString);
+        }
+
+        Point bestSize = null;
+        float screenAspectRatio = (float)screenResolution.x / (float)screenResolution.y;
+
+        float diff = Float.POSITIVE_INFINITY;
+        for (Camera.Size supportedPreviewSize : supportedPreviewSizes) {
+            int realWidth = supportedPreviewSize.width;
+            int realHeight = supportedPreviewSize.height;
+            int pixels = realWidth * realHeight;
+            if (pixels < MIN_PREVIEW_PIXELS || pixels > MAX_PREVIEW_PIXELS) {
+                continue;
+            }
+            boolean isCandidatePortrait = realWidth < realHeight;
+            int maybeFlippedWidth = isCandidatePortrait ? realHeight : realWidth;
+            int maybeFlippedHeight = isCandidatePortrait ? realWidth : realHeight;
+            if (maybeFlippedWidth == screenResolution.x && maybeFlippedHeight == screenResolution.y) {
+                Point exactPoint = new Point(realWidth, realHeight);
+                Log.i(TAG, "Found preview size exactly matching screen size: " + exactPoint);
+                return exactPoint;
+            }
+            float aspectRatio = (float)maybeFlippedWidth / (float)maybeFlippedHeight;
+            float newDiff = Math.abs(aspectRatio - screenAspectRatio);
+            if (newDiff < diff) {
+                bestSize = new Point(realWidth, realHeight);
+                diff = newDiff;
+            }
+        }
+
+        if (bestSize == null) {
+            Camera.Size defaultSize = parameters.getPreviewSize();
+            bestSize = new Point(defaultSize.width, defaultSize.height);
+            Log.i(TAG, "No suitable preview sizes, using default: " + bestSize);
+        }
+
+        Log.i(TAG, "Found best approximate preview size: " + bestSize);
+        return bestSize;
+    }
+
+    private static String findSettableValue(Collection<String> supportedValues, String... desiredValues) {
+        Log.i(TAG, "Supported values: " + supportedValues);
+        String result = null;
+        if (supportedValues != null) {
+            for (String desiredValue : desiredValues) {
+                if (supportedValues.contains(desiredValue)) {
+                    result = desiredValue;
+                    break;
+                }
+            }
+        }
+        Log.i(TAG, "Settable value: " + result);
+        return result;
+    }
+
 }

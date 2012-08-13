@@ -1,5 +1,4 @@
-/* This code is based on code from the ZXing project.
- *  
+/*
  * Copyright (C) 2008 ZXing authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +16,6 @@
 
 package org.tiqr.authenticator.qr;
 
-import java.io.IOException;
-
 import org.tiqr.authenticator.ActivityDialog;
 import org.tiqr.authenticator.R;
 import org.tiqr.authenticator.TiqrActivity;
@@ -26,6 +23,8 @@ import org.tiqr.authenticator.authentication.AuthenticationActivityGroup;
 import org.tiqr.authenticator.enrollment.EnrollmentActivityGroup;
 import org.tiqr.authenticator.qr.camera.CameraManager;
 
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.Result;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.Bundle;
@@ -38,87 +37,123 @@ import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.TextView;
-
-import com.google.zxing.Result;
+import java.io.IOException;
+import java.util.Collection;
 
 /**
- * Capture activity.
+ * This activity opens the camera and does the actual scanning on a background thread. It draws a viewfinder to help the user place the barcode correctly, shows
+ * feedback as the image processing is happening, and then overlays the results when a scan is successful.
+ * 
+ * @author dswitkin@google.com (Daniel Switkin)
+ * @author Sean Owen
+ * 
+ *         Heavily modded by Egeniq
  */
-public class CaptureActivity extends TiqrActivity implements SurfaceHolder.Callback
-{
+public final class CaptureActivity extends TiqrActivity implements SurfaceHolder.Callback {
+
     private static final String TAG = CaptureActivity.class.getSimpleName();
 
+    private CameraManager cameraManager;
     private CaptureActivityHandler handler;
     private ViewfinderView viewfinderView;
+    private TextView statusView;
+
     private boolean hasSurface;
+    private Collection<BarcodeFormat> decodeFormats;
+    private String characterSet;
+
+    private InactivityTimer inactivityTimer;
     private BeepManager beepManager;
     private ActivityDialog activityDialog;
 
-    public ViewfinderView getViewfinderView()
-    {
+    public ViewfinderView getViewfinderView() {
         return viewfinderView;
     }
 
-    public Handler getHandler()
-    {
+    public Handler getHandler() {
         return handler;
     }
 
+    CameraManager getCameraManager() {
+        return cameraManager;
+    }
+
     @Override
-    public void onCreate(Bundle icicle)
-    {
+    public void onCreate(Bundle icicle) {
+        // super.onCreate(icicle);
         super.onCreate(icicle, R.layout.capture);
 
         Window window = getWindow();
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        
+
         disableIdentityButton();
         hideLeftButton();
         setTitle(R.string.scan_button);
 
-        CameraManager.init(getApplication());
-        viewfinderView = (ViewfinderView) findViewById(R.id.viewfinder_view);
-        handler = null;
         hasSurface = false;
+        inactivityTimer = new InactivityTimer(this);
         beepManager = new BeepManager(this);
     }
 
     @Override
-    protected void onResume()
-    {
+    protected void onResume() {
         super.onResume();
 
-        SurfaceView surfaceView = (SurfaceView) findViewById(R.id.preview_view);
+        // CameraManager must be initialized here, not in onCreate(). This is necessary because we don't
+        // want to open the camera driver and measure the screen size if we're going to show the help on
+        // first launch. That led to bugs where the scanning rectangle was the wrong size and partially
+        // off screen.
+        cameraManager = new CameraManager(getApplication());
+
+        viewfinderView = (ViewfinderView)findViewById(R.id.viewfinder_view);
+        viewfinderView.setCameraManager(cameraManager);
+        statusView = (TextView)findViewById(R.id.status_view);
+
+        handler = null;
+
+        resetStatusView();
+
+        SurfaceView surfaceView = (SurfaceView)findViewById(R.id.preview_view);
         SurfaceHolder surfaceHolder = surfaceView.getHolder();
         if (hasSurface) {
-            // The activity was paused but not stopped, so the surface still
-            // exists. Therefore
+            // The activity was paused but not stopped, so the surface still exists. Therefore
             // surfaceCreated() won't be called, so init the camera here.
             initCamera(surfaceHolder);
         } else {
-            // Install the callback and wait for surfaceCreated() to init the
-            // camera.
+            // Install the callback and wait for surfaceCreated() to init the camera.
             surfaceHolder.addCallback(this);
             surfaceHolder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
         }
 
         beepManager.updatePrefs();
+
+        inactivityTimer.onResume();
     }
 
     @Override
-    protected void onPause()
-    {
-        super.onPause();
+    protected void onPause() {
         if (handler != null) {
             handler.quitSynchronously();
             handler = null;
         }
-        CameraManager.get().closeDriver();
+        inactivityTimer.onPause();
+        cameraManager.closeDriver();
+        if (!hasSurface) {
+            SurfaceView surfaceView = (SurfaceView)findViewById(R.id.preview_view);
+            SurfaceHolder surfaceHolder = surfaceView.getHolder();
+            surfaceHolder.removeCallback(this);
+        }
+        super.onPause();
     }
 
     @Override
-    public void surfaceCreated(SurfaceHolder holder)
-    {
+    protected void onDestroy() {
+        inactivityTimer.shutdown();
+        super.onDestroy();
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
         if (!hasSurface) {
             hasSurface = true;
             initCamera(holder);
@@ -126,101 +161,104 @@ public class CaptureActivity extends TiqrActivity implements SurfaceHolder.Callb
     }
 
     @Override
-    public void surfaceDestroyed(SurfaceHolder holder)
-    {
+    public void surfaceDestroyed(SurfaceHolder holder) {
         hasSurface = false;
     }
 
     @Override
-    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height)
-    {
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
 
     }
 
     /**
-     * A valid barcode has been found, so give an indication of success and show
-     * the results.
+     * A valid barcode has been found, so give an indication of success and show the results.
      * 
-     * @param rawResult
-     *            The contents of the barcode.
-     * @param barcode
-     *            A greyscale bitmap of the camera data which was decoded.
+     * @param rawResult The contents of the barcode.
+     * @param barcode A greyscale bitmap of the camera data which was decoded.
      */
-    public void handleDecode(final Result rawResult, Bitmap barcode)
-    {
-    	// This hardly shows anything, because the following actions are too fast
-    	activityDialog = ActivityDialog.show(this);
+    public void handleDecode(final Result rawResult, Bitmap barcode) {
+        inactivityTimer.onActivity();
+        // This hardly shows anything, because the following actions are too fast
+        activityDialog = ActivityDialog.show(this);
         beepManager.playBeepSoundAndVibrate();
-        new Thread(new Runnable() {
 
-			@Override
-			public void run() {
-				String text = rawResult.getText();
-				Message msg = new Message();
-				msg.obj = rawResult;
-				
-		        if (text.startsWith("tiqrauth")) {
-		        	_handleCaptureResultAsAuthentication.sendMessage(msg);
-		        } else if (text.startsWith("tiqrenroll")) {
-		        	_handleCaptureResultAsEnrollment.sendMessage(msg);
-		        }
-			}
+        if (barcode != null) {
+            //
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    String text = rawResult.getText();
+                    Message msg = new Message();
+                    msg.obj = rawResult;
 
-		}).start();
+                    if (text.startsWith("tiqrauth")) {
+                        _handleCaptureResultAsAuthentication.sendMessage(msg);
+                    } else if (text.startsWith("tiqrenroll")) {
+                        _handleCaptureResultAsEnrollment.sendMessage(msg);
+                    }
+                }
+            }).start();
+        }
     }
 
-    private void initCamera(SurfaceHolder surfaceHolder)
-    {
+    private void initCamera(SurfaceHolder surfaceHolder) {
+        if (surfaceHolder == null) {
+            throw new IllegalStateException("No SurfaceHolder provided");
+        }
+        if (cameraManager.isOpen()) {
+            Log.w(TAG, "initCamera() while already open -- late SurfaceView callback?");
+            return;
+        }
         try {
-            CameraManager.get().openDriver(surfaceHolder);
+            cameraManager.openDriver(surfaceHolder);
+            // Creating the handler starts the preview, which can also throw a RuntimeException.
+            if (handler == null) {
+                handler = new CaptureActivityHandler(this, decodeFormats, characterSet, cameraManager);
+            }
         } catch (IOException ioe) {
             Log.w(TAG, ioe);
-            return;
         } catch (RuntimeException e) {
             // Barcode Scanner has seen crashes in the wild of this variety:
-            // java.lang.RuntimeException: Fail to connect to camera service
-            Log.w(TAG, "Unexpected error initializating camera", e);
-            return;
-        }
-        
-        if (handler == null) {
-            handler = new CaptureActivityHandler(this);
-        
-            Message msg = new Message();
-            msg.what = R.id.scan_inactivity;
-            handler.sendMessageDelayed(msg, 3000);
+            // java.?lang.?RuntimeException: Fail to connect to camera service
+            Log.w(TAG, "Unexpected error initializing camera", e);
         }
     }
 
-    public void drawViewfinder()
-    {
+    public void restartPreviewAfterDelay(long delayMS) {
+        if (handler != null) {
+            handler.sendEmptyMessageDelayed(R.id.restart_preview, delayMS);
+        }
+        resetStatusView();
+    }
+
+    private void resetStatusView() {
+        statusView.setText(R.string.msg_default_status);
+        statusView.setVisibility(View.VISIBLE);
+        viewfinderView.setVisibility(View.VISIBLE);
+    }
+
+    public void drawViewfinder() {
         viewfinderView.drawViewfinder();
     }
 
-    
     private Handler _handleCaptureResultAsAuthentication = new Handler() {
-    	@Override
-		public void handleMessage(Message msg) {
-    		Intent intent = new Intent(getApplicationContext(), AuthenticationActivityGroup.class);
-        	intent.putExtra("org.tiqr.rawChallenge", ((Result)msg.obj).getText());
-        	startActivity(intent);
-        	activityDialog.cancel();
-		}
-    };
-    
-    private Handler _handleCaptureResultAsEnrollment = new Handler() {
-    	@Override
-		public void handleMessage(Message msg) {
-    		Intent intent = new Intent(getApplicationContext(), EnrollmentActivityGroup.class);
-        	intent.putExtra("org.tiqr.rawChallenge", ((Result)msg.obj).getText());
-        	startActivity(intent);
-        	activityDialog.cancel();
-    	}
+        @Override
+        public void handleMessage(Message msg) {
+            Intent intent = new Intent(getApplicationContext(), AuthenticationActivityGroup.class);
+            intent.putExtra("org.tiqr.rawChallenge", ((Result)msg.obj).getText());
+            startActivity(intent);
+            activityDialog.cancel();
+        }
     };
 
-	public void handleInactivity() {
-		// TODO Auto-generated method stub
-		TextView statusView = (TextView) findViewById(R.id.status_view);
-		statusView.setVisibility(View.VISIBLE);
-	}
+    private Handler _handleCaptureResultAsEnrollment = new Handler() {
+        @Override
+        public void handleMessage(Message msg) {
+            Intent intent = new Intent(getApplicationContext(), EnrollmentActivityGroup.class);
+            intent.putExtra("org.tiqr.rawChallenge", ((Result)msg.obj).getText());
+            startActivity(intent);
+            activityDialog.cancel();
+        }
+    };
+
 }

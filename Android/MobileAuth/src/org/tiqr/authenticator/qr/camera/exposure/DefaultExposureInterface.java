@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009 ZXing authors
+ * Copyright (C) 2012 ZXing authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,15 @@
  * limitations under the License.
  */
 
-package org.tiqr.authenticator.qr;
+package org.tiqr.authenticator.qr.camera.exposure;
 
-import com.google.zxing.ResultPoint;
-import com.google.zxing.ResultPointCallback;
+import android.hardware.Camera;
 
-final class ViewfinderResultPointCallback implements ResultPointCallback {
-
-    private final ViewfinderView viewfinderView;
-
-    ViewfinderResultPointCallback(ViewfinderView viewfinderView) {
-        this.viewfinderView = viewfinderView;
-    }
+public final class DefaultExposureInterface implements ExposureInterface {
 
     @Override
-    public void foundPossibleResultPoint(ResultPoint point) {
-        viewfinderView.addPossibleResultPoint(point);
+    public void setExposure(Camera.Parameters parameters, boolean lightOn) {
+        // Do nothing
     }
 
 }
